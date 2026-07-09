@@ -1,0 +1,141 @@
+name: Autograde Submission
+
+# Runs whenever a student pushes to their submissions/<username> branch
+on:
+  push:
+    branches:
+      - "submissions/**"
+
+permissions:
+  contents: write   # needed so the bot can commit leaderboard updates
+  checks: write      # needed to post pass/fail check results
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      authorized: ${{ steps.check.outputs.authorized }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check pusher matches branch owner
+        id: check
+        run: |
+          BRANCH_OWNER="${GITHUB_REF#refs/heads/submissions/}"
+          ACTOR="${GITHUB_ACTOR}"
+          echo "Branch owner should be: $BRANCH_OWNER, actual pusher: $ACTOR"
+          if [ "$BRANCH_OWNER" = "$ACTOR" ]; then
+            echo "authorized=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "authorized=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Revert unauthorized push
+        if: steps.check.outputs.authorized == 'false'
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          # If this is the branch's very first push, there's no prior commit
+          # to revert to — just fail loudly instead.
+          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "First-ever push to this branch was unauthorized. Manual cleanup needed."
+            exit 0
+          fi
+          git config user.name "branch-guard-bot"
+          git config user.email "branch-guard-bot@users.noreply.github.com"
+          git fetch origin "$BEFORE_SHA"
+          git reset --hard "$BEFORE_SHA"
+          git push --force origin "HEAD:${GITHUB_REF#refs/heads/}"
+
+      - name: Flag unauthorized push
+        if: steps.check.outputs.authorized == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Branch Guard',
+              head_sha: context.sha,
+              status: 'completed',
+              conclusion: 'failure',
+              output: {
+                title: 'Unauthorized push blocked and reverted',
+                summary: `@${context.actor} pushed to \`${context.ref}\`, which belongs to a different student. The push was reverted. If this was a mistake, push again from the correct account.`
+              }
+            });
+
+  grade:
+    needs: guard
+    if: needs.guard.outputs.authorized == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout student branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install grading dependencies
+        run: pip install pytest  # add any per-challenge deps here too
+
+      - name: Identify which challenges changed
+        id: changed
+        run: |
+          # Compare against main to find which solutions/<challenge> dirs were touched
+          git fetch origin main
+          CHANGED=$(git diff --name-only origin/main...HEAD -- 'solutions/' | cut -d/ -f2 | sort -u)
+          echo "changed_challenges<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Run grader
+        id: grade
+        run: |
+          STUDENT="${GITHUB_REF#refs/heads/submissions/}"
+          python grader/run_tests.py \
+            --student "$STUDENT" \
+            --changed "${{ steps.changed.outputs.changed_challenges }}" \
+            --output results.json
+
+      - name: Post results as a Check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const results = JSON.parse(fs.readFileSync('results.json', 'utf8'));
+            const summary = results.details.map(d =>
+              `**${d.challenge}**: ${d.passed}/${d.total} tests passed`
+            ).join('\n');
+
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Autograder',
+              head_sha: context.sha,
+              status: 'completed',
+              conclusion: results.overall_pass ? 'success' : 'failure',
+              output: {
+                title: results.overall_pass ? 'All tests passed' : 'Some tests failed',
+                summary
+              }
+            });
+
+      - name: Update leaderboard
+        run: |
+          python grader/update_leaderboard.py --results results.json
+
+      - name: Commit leaderboard changes
+        run: |
+          git config user.name "autograder-bot"
+          git config user.email "autograder-bot@users.noreply.github.com"
+          git add leaderboard.md leaderboard.json
+          git diff --cached --quiet || git commit -m "Update leaderboard for ${GITHUB_REF#refs/heads/submissions/}"
+          git push origin HEAD:main
